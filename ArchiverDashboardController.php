@@ -6,6 +6,8 @@ use Yii;
 use yii\web\Controller;
 use yii\web\Response;
 use yii\web\BadRequestHttpException;
+use yii\web\ForbiddenHttpException;
+use yii\web\NotFoundHttpException;
 use yii\filters\AccessControl;
 use yii\httpclient\Client;
 use yii\data\ActiveDataProvider;
@@ -193,7 +195,7 @@ class ArchiverDashboardController extends Controller
     public function actionSimilarityImport()
     {
         if (!Yii::$app->user->can('admin')) {
-            throw new \yii\web\ForbiddenHttpException('Admins only');
+            throw new ForbiddenHttpException('Admins only');
         }
 
         $defaults = [
@@ -371,7 +373,7 @@ class ArchiverDashboardController extends Controller
     public function actionImportSimilarityGroups()
     {
         if (!Yii::$app->user->can('admin')) {
-            throw new \yii\web\ForbiddenHttpException('Admins only');
+            throw new ForbiddenHttpException('Admins only');
         }
 
         Yii::$app->response->format = Response::FORMAT_JSON;
@@ -716,7 +718,7 @@ class ArchiverDashboardController extends Controller
     public function actionRebuildTopFromExisting()
     {
         if (!Yii::$app->user->can('admin')) {
-            throw new \yii\web\ForbiddenHttpException('Admins only');
+            throw new ForbiddenHttpException('Admins only');
         }
 
         Yii::$app->response->format = \yii\web\Response::FORMAT_JSON;
