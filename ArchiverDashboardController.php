@@ -13,9 +13,11 @@ use yii\db\Expression;
 use yii\db\Query;
 use yii\data\ArrayDataProvider;
 use backend\modules\notary\services\SimilarityGroupsImporter;
+use backend\modules\notary\services\ArchiverSimilarityTopImageRebuilder;
 use backend\modules\notary\models\ArchiverSimilarityGroup;
 use backend\modules\notary\models\ArchiverSimilarityImage;
 use backend\modules\notary\models\ArchiverSimilarityDistance;
+use backend\modules\notary\models\ArchiverSimilarityTopImage;
 
 class ArchiverDashboardController extends Controller
 {
@@ -144,6 +146,49 @@ class ArchiverDashboardController extends Controller
         ]);
 
         return $this->render('similarity-images', ['dataProvider' => $dp]);
+    }
+
+    public function actionTopImages()
+    {
+        $q = ArchiverSimilarityTopImage::find();
+
+        $type = Yii::$app->request->get('type', ''); // vm|other|mixed
+        if ($type === 'vm') {
+            $q->andWhere('vm_occurrence_count = occurrence_count');
+        } elseif ($type === 'other') {
+            $q->andWhere('vm_occurrence_count = 0');
+        } elseif ($type === 'mixed') {
+            $q->andWhere('vm_occurrence_count > 0 AND vm_occurrence_count < occurrence_count');
+        }
+
+        $periodFrom = Yii::$app->request->get('period_from');
+        if ($periodFrom) {
+            $q->andWhere(['>=', 'last_seen_at', strtotime($periodFrom . ' 00:00:00')]);
+        }
+
+        $periodTo = Yii::$app->request->get('period_to');
+        if ($periodTo) {
+            $q->andWhere(['<=', 'last_seen_at', strtotime($periodTo . ' 23:59:59')]);
+        }
+
+        $minOccurrences = Yii::$app->request->get('min_occurrences');
+        if ($minOccurrences !== null && $minOccurrences !== '') {
+            $q->andWhere(['>=', 'occurrence_count', (int)$minOccurrences]);
+        }
+
+        $sort = Yii::$app->request->get('sort', 'occurrence_desc');
+        if ($sort === 'occurrence_asc') {
+            $q->orderBy(['occurrence_count' => SORT_ASC, 'canonical_image_key' => SORT_ASC]);
+        } else {
+            $q->orderBy(['occurrence_count' => SORT_DESC, 'canonical_image_key' => SORT_ASC]);
+        }
+
+        $dp = new ActiveDataProvider([
+            'query' => $q,
+            'pagination' => ['pageSize' => (int)Yii::$app->request->get('per_page', 50)],
+        ]);
+
+        return $this->render('top-images', ['dataProvider' => $dp]);
     }
 
 
@@ -721,142 +766,20 @@ class ArchiverDashboardController extends Controller
 
         Yii::$app->response->format = \yii\web\Response::FORMAT_JSON;
 
-        $imageType = (string)Yii::$app->request->get('image_type', 'mixed'); // '', vm, other, mixed
-        $limit = max(1, (int)Yii::$app->request->get('limit', 500));
         $reset = ((int)Yii::$app->request->get('reset', 1) === 1);
-
-        // 1) Забираем TOP
-        $params = ['limit' => $limit];
-        if ($imageType !== '') $params['image_type'] = $imageType;
-
-        $top = $this->apiGet('/api/v1/archiver/stats/top_images', $params); // :contentReference[oaicite:2]{index=2}
-        if (!empty($top['_error'])) {
-            return $top;
-        }
-
-        $items = $top['top_recurring_images'] ?? [];
-        if (!is_array($items)) $items = [];
-
-        $now = time();
-
-        // 2) Сброс флагов
-        $resetGroups = 0;
-        $resetImages = 0;
-
-        if ($reset) {
-            $resetGroups = ArchiverSimilarityGroup::updateAll([
-                'is_top' => 0,
-                'top_occurrence_count' => null,
-                'top_avg_similarity' => null,
-                'updated_at' => $now,
-            ]);
-
-            $resetImages = ArchiverSimilarityImage::updateAll([
-                'is_top_group' => 0,
-                'updated_at' => $now,
-            ]);
-        }
-
-        // 3) Собираем:
-        // - group_id -> мета
-        // - список URL (source_urls + sample_image.url)
-        $topByGroup = [];
-        $urls = [];
-
-        foreach ($items as $it) {
-            $gid = (int)($it['group_id'] ?? 0);
-            if ($gid > 0) {
-                $topByGroup[$gid] = [
-                    'occurrence_count' => isset($it['occurrence_count']) ? (int)$it['occurrence_count'] : null,
-                    'avg_similarity' => isset($it['avg_similarity']) ? (float)$it['avg_similarity'] : null,
-                ];
-            }
-
-            // source_urls[]
-            if (!empty($it['source_urls']) && is_array($it['source_urls'])) {
-                foreach ($it['source_urls'] as $u) {
-                    $u = $this->normalizeUrlForMatch((string)$u);
-                    if ($u !== '') $urls[$u] = true;
-                }
-            }
-
-            // sample_image.url
-            $sampleUrl = $it['sample_image']['url'] ?? null; // :contentReference[oaicite:3]{index=3}
-            if (is_string($sampleUrl)) {
-                $u = $this->normalizeUrlForMatch($sampleUrl);
-                if ($u !== '') $urls[$u] = true;
-            }
-        }
-
-        $groupIds = array_keys($topByGroup);
-        $urlList = array_keys($urls);
-
-        // 4) Проставляем TOP в groups по group_id
-        $markedGroups = 0;
-        $markedGroupsIds = 0;
-
-        if (!empty($groupIds)) {
-            $markedGroups = ArchiverSimilarityGroup::updateAll([
-                'is_top' => 1,
-                'updated_at' => $now,
-            ], ['in', 'group_id', $groupIds]);
-
-            // occurrence_count / avg_similarity — точечно по group_id
-            foreach ($topByGroup as $gid => $meta) {
-                ArchiverSimilarityGroup::updateAll([
-                    'top_occurrence_count' => $meta['occurrence_count'],
-                    'top_avg_similarity' => $meta['avg_similarity'],
-                    'updated_at' => $now,
-                ], ['group_id' => (int)$gid]);
-                $markedGroupsIds++;
-            }
-        }
-
-        // 5) Проставляем TOP в images:
-        // 5.1) по group_id (если группы уже в БД)
-        $markedImagesByGroup = 0;
-        if (!empty($groupIds)) {
-            $markedImagesByGroup = ArchiverSimilarityImage::updateAll([
-                'is_top_group' => 1,
-                'updated_at' => $now,
-            ], ['in', 'group_id', $groupIds]);
-        }
-
-        // 5.2) по URL (важный момент)
-        $markedImagesByUrl = 0;
-        if (!empty($urlList)) {
-            // Сравниваем по LOWER(source_url) с LOWER(переданных URL),
-            // потому что в top_images в примере есть "Https://..." :contentReference[oaicite:4]{index=4}
-            $lowerUrls = array_map(static fn($s) => mb_strtolower($s, 'UTF-8'), $urlList);
-
-            $markedImagesByUrl = ArchiverSimilarityImage::updateAll(
-                ['is_top_group' => 1, 'updated_at' => $now],
-                ['in', new Expression('LOWER(source_url)'), $lowerUrls]
-            );
-        }
+        $rebuilder = new ArchiverSimilarityTopImageRebuilder();
+        $result = $rebuilder->rebuild($reset);
 
         return [
             'status' => 'ok',
             'ts' => date('Y-m-d H:i:s'),
             'request' => [
-                'image_type' => $imageType,
-                'limit' => $limit,
                 'reset' => $reset ? 1 : 0,
             ],
-            'top' => [
-                'items' => count($items),
-                'unique_group_ids' => count($groupIds),
-                'unique_urls' => count($urlList),
-            ],
-            'reset' => [
-                'groups_rows' => $resetGroups,
-                'images_rows' => $resetImages,
-            ],
-            'marked' => [
-                'groups_rows_is_top' => $markedGroups,
-                'groups_rows_updated_meta' => $markedGroupsIds,
-                'images_rows_by_group_id' => $markedImagesByGroup,
-                'images_rows_by_url' => $markedImagesByUrl,
+            'aggregation' => [
+                'target_table' => ArchiverSimilarityTopImage::tableName(),
+                'rows_inserted' => $result['rows_inserted'],
+                'recalculated_at' => $result['recalculated_at'],
             ],
         ];
     }
