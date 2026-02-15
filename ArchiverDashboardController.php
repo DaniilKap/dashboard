@@ -13,6 +13,7 @@ use yii\db\Expression;
 use yii\db\Query;
 use yii\data\ArrayDataProvider;
 use backend\modules\notary\services\SimilarityGroupsImporter;
+use backend\modules\notary\services\SimilarityUrlNormalizer;
 use backend\modules\notary\models\ArchiverSimilarityGroup;
 use backend\modules\notary\models\ArchiverSimilarityImage;
 use backend\modules\notary\models\ArchiverSimilarityDistance;
@@ -35,6 +36,11 @@ class ArchiverDashboardController extends Controller
     {
         // Лучше положить в params.php / module params
         return Yii::$app->params['archiverApiBase'] ?? 'http://185.189.167.89:8000';
+    }
+
+    private function urlNormalizer(): SimilarityUrlNormalizer
+    {
+        return new SimilarityUrlNormalizer();
     }
 
     private function apiRequest(string $method, string $path, array $query = []): array
@@ -244,50 +250,51 @@ class ArchiverDashboardController extends Controller
     }
     public function actionSimilarityVkGroups()
     {
-
-
         $limit = max(10, (int)Yii::$app->request->get('limit', 10000));
-        $t = '{{%archiver_similarity_image}}';
 
-        // Нормализуем URL группы:
-        // - убираем query и trailing slash
-        // - оставляем https://vk.com/<slug>
-        $norm = new Expression("
-      LOWER(
-        REGEXP_REPLACE(
-          REGEXP_SUBSTR(found_at_url, 'https?://vk\\.com/[^\\?\\#\\s]+'),
-          '/+$',
-          ''
-        )
-      )
-    ");
+        $normalizer = $this->urlNormalizer();
+        $counts = [];
 
-        $rows = (new \yii\db\Query())
-            ->from($t)
-            ->select([
-                'vk_group' => $norm,
-                'images' => new Expression("COUNT(*)"),
-                'groups' => new Expression("COUNT(DISTINCT group_id)"),
-            ])
-            ->where(['like', 'found_at_url', 'vk.com/', false])
-            ->andWhere(['not', ['found_at_url' => null]])
-            ->groupBy($norm)
-            ->orderBy(['images' => SORT_DESC])
-            ->limit($limit)
-            ->all();
+        foreach ((new Query())
+                     ->from(ArchiverSimilarityImage::tableName())
+                     ->select(['group_id', 'found_at_url', 'normalized_url'])
+                     ->batch(1000) as $batch) {
+            foreach ($batch as $row) {
+                $candidate = (string)($row['found_at_url'] ?: $row['normalized_url'] ?: '');
+                $normalized = $normalizer->normalizeUrlForMatch($candidate, false, true);
+                if ($normalized === '' || stripos($normalized, '://vk.com/') === false) {
+                    continue;
+                }
+
+                $parts = parse_url($normalized);
+                $path = (string)($parts['path'] ?? '');
+                if ($path === '' || $path === '/') {
+                    continue;
+                }
+
+                $vkGroup = 'https://vk.com' . rtrim($path, '/');
+                if (!isset($counts[$vkGroup])) {
+                    $counts[$vkGroup] = ['images' => 0, 'group_ids' => []];
+                }
+
+                $counts[$vkGroup]['images']++;
+                $counts[$vkGroup]['group_ids'][(int)($row['group_id'] ?? 0)] = true;
+            }
+        }
 
         $out = [];
-        foreach ($rows as $r) {
-            $u = (string)($r['vk_group'] ?? '');
-            if ($u === '') continue;
+        foreach ($counts as $vkGroup => $meta) {
             $out[] = [
-                'vk_group' => $u,
-                'images' => (int)$r['images'],
-                'groups' => (int)$r['groups'],
+                'vk_group' => $vkGroup,
+                'images' => (int)$meta['images'],
+                'groups' => count($meta['group_ids']),
             ];
         }
 
-        $dp = new \yii\data\ArrayDataProvider([
+        usort($out, static fn($a, $b) => $b['images'] <=> $a['images']);
+        $out = array_slice($out, 0, $limit);
+
+        $dp = new ArrayDataProvider([
             'allModels' => $out,
             'pagination' => ['pageSize' => 100],
             'sort' => false,
@@ -300,57 +307,52 @@ class ArchiverDashboardController extends Controller
 
     public function actionSimilaritySites()
     {
-
-
         $type = (string)Yii::$app->request->get('type', 'found'); // found|source|both
         $limit = max(10, (int)Yii::$app->request->get('limit', 5000));
 
-        // Базовая таблица
-        $t = '{{%archiver_similarity_image}}';
+        $normalizer = $this->urlNormalizer();
+        $counts = [];
 
-        // host из URL (MySQL 8 REGEXP_SUBSTR)
-        // https?://<host>/
-        $hostExpr = function(string $col) {
-            return new Expression("LOWER(REGEXP_SUBSTR($col, 'https?://[^/]+'))");
-        };
+        foreach ((new Query())
+                     ->from(ArchiverSimilarityImage::tableName())
+                     ->select(['group_id', 'found_at_url', 'source_url', 'normalized_url', 'discovery_domain'])
+                     ->batch(1000) as $batch) {
+            foreach ($batch as $row) {
+                $candidate = '';
+                if ($type === 'source') {
+                    $candidate = (string)($row['source_url'] ?? '');
+                } elseif ($type === 'both') {
+                    $candidate = (string)($row['normalized_url'] ?: $row['found_at_url'] ?: $row['source_url'] ?: '');
+                } else {
+                    $candidate = (string)($row['found_at_url'] ?? '');
+                }
 
-        // Для "both" берём COALESCE(found_at_url, source_url)
-        $urlExpr = ($type === 'source')
-            ? new Expression("source_url")
-            : (($type === 'both')
-                ? new Expression("COALESCE(found_at_url, source_url)")
-                : new Expression("found_at_url"));
+                $normalized = $normalizer->normalizeUrlForMatch($candidate, false, true);
+                $domain = $normalizer->extractDomain($row['discovery_domain'] ?: $normalized);
+                if ($domain === null) {
+                    continue;
+                }
 
-        $host = new Expression("LOWER(REGEXP_SUBSTR($urlExpr, 'https?://[^/]+'))");
+                if (!isset($counts[$domain])) {
+                    $counts[$domain] = ['images' => 0, 'group_ids' => []];
+                }
 
-        $rows = (new Query())
-            ->from($t)
-            ->select([
-                'host' => $host, // вернёт 'https://domain.tld'
-                'images' => new Expression("COUNT(*)"),
-                'groups' => new Expression("COUNT(DISTINCT group_id)"),
-            ])
-            ->where(new Expression("$urlExpr IS NOT NULL"))
-            ->andWhere(new Expression("TRIM($urlExpr) <> ''"))
-            ->groupBy($host)
-            ->orderBy(['images' => SORT_DESC])
-            ->limit($limit)
-            ->all();
+                $counts[$domain]['images']++;
+                $counts[$domain]['group_ids'][(int)($row['group_id'] ?? 0)] = true;
+            }
+        }
 
-        // Приведём host к domain без схемы для красоты
         $out = [];
-        foreach ($rows as $r) {
-            $h = (string)($r['host'] ?? '');
-            if ($h === '') continue;
-
-            $domain = preg_replace('~^https?://~i', '', $h);
+        foreach ($counts as $domain => $meta) {
             $out[] = [
                 'domain' => $domain,
-                'host' => $h,
-                'images' => (int)$r['images'],
-                'groups' => (int)$r['groups'],
+                'images' => (int)$meta['images'],
+                'groups' => count($meta['group_ids']),
             ];
         }
+
+        usort($out, static fn($a, $b) => $b['images'] <=> $a['images']);
+        $out = array_slice($out, 0, $limit);
 
         $dp = new ArrayDataProvider([
             'allModels' => $out,
@@ -401,6 +403,7 @@ class ArchiverDashboardController extends Controller
         }
 
         $now = time();
+        $normalizer = $this->urlNormalizer();
         $savedGroups = 0;
         $savedImages = 0;
         $savedDistances = 0;
@@ -559,20 +562,15 @@ class ArchiverDashboardController extends Controller
                 $row->image_hash = $im['image_hash'] ?? null;
                 $row->milvus_id = isset($im['milvus_id']) ? (int)$im['milvus_id'] : null;
                 $row->source_url = $im['source_url'] ?? null;
-                $row->discovery_domain = $im['discovery_domain'] ?? null;
                 $row->found_at_url = $im['found_at_url'] ?? null;
 
-// если API не дал discovery_domain, попробуем вывести из found_at_url / source_url
-                if (!$row->discovery_domain) {
-                    $candidate = $row->found_at_url ?: $row->source_url;
-                    if ($candidate) {
-                        $host = parse_url($candidate, PHP_URL_HOST);
-                        if ($host) $row->discovery_domain = $host;
-                    }
+                $row->normalized_url = $normalizer->normalizeUrlForMatch((string)($row->source_url ?: $row->found_at_url), false, true) ?: null;
+
+                $discoveryDomain = $normalizer->extractDomain($im['discovery_domain'] ?? null);
+                if ($discoveryDomain === null) {
+                    $discoveryDomain = $normalizer->extractDomain($row->found_at_url ?: $row->source_url);
                 }
-
-
-
+                $row->discovery_domain = $discoveryDomain;
 
                 $row->created_at_api = $im['created_at'] ?? null;
                 $row->added_to_group_at = $im['added_to_group_at'] ?? null;
@@ -738,6 +736,7 @@ class ArchiverDashboardController extends Controller
         if (!is_array($items)) $items = [];
 
         $now = time();
+        $normalizer = $this->urlNormalizer();
 
         // 2) Сброс флагов
         $resetGroups = 0;
@@ -775,7 +774,7 @@ class ArchiverDashboardController extends Controller
             // source_urls[]
             if (!empty($it['source_urls']) && is_array($it['source_urls'])) {
                 foreach ($it['source_urls'] as $u) {
-                    $u = $this->normalizeUrlForMatch((string)$u);
+                    $u = $normalizer->normalizeUrlForMatch((string)$u, false, true);
                     if ($u !== '') $urls[$u] = true;
                 }
             }
@@ -783,7 +782,7 @@ class ArchiverDashboardController extends Controller
             // sample_image.url
             $sampleUrl = $it['sample_image']['url'] ?? null; // :contentReference[oaicite:3]{index=3}
             if (is_string($sampleUrl)) {
-                $u = $this->normalizeUrlForMatch($sampleUrl);
+                $u = $normalizer->normalizeUrlForMatch($sampleUrl, false, true);
                 if ($u !== '') $urls[$u] = true;
             }
         }
@@ -825,13 +824,9 @@ class ArchiverDashboardController extends Controller
         // 5.2) по URL (важный момент)
         $markedImagesByUrl = 0;
         if (!empty($urlList)) {
-            // Сравниваем по LOWER(source_url) с LOWER(переданных URL),
-            // потому что в top_images в примере есть "Https://..." :contentReference[oaicite:4]{index=4}
-            $lowerUrls = array_map(static fn($s) => mb_strtolower($s, 'UTF-8'), $urlList);
-
             $markedImagesByUrl = ArchiverSimilarityImage::updateAll(
                 ['is_top_group' => 1, 'updated_at' => $now],
-                ['in', new Expression('LOWER(source_url)'), $lowerUrls]
+                ['in', 'normalized_url', $urlList]
             );
         }
 
@@ -861,23 +856,6 @@ class ArchiverDashboardController extends Controller
         ];
     }
 
-    /**
-     * Нормализация URL под матчинг в БД:
-     * - trim
-     * - убрать #fragment
-     * - НЕ трогаем query (бывает важен), но можно будет расширить
-     */
-    private function normalizeUrlForMatch(string $url): string
-    {
-        $url = trim($url);
-        if ($url === '') return '';
-
-        // remove fragment
-        $hashPos = strpos($url, '#');
-        if ($hashPos !== false) $url = substr($url, 0, $hashPos);
-
-        return $url;
-    }
     public function actionSimilarityGroupsWithVm()
     {
 
