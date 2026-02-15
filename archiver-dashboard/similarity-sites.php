@@ -21,7 +21,7 @@ $this->title = 'Сайты, попавшие в группы (без повто�
 
     <div class="box-body">
         <div class="alert alert-info" style="margin-bottom:10px;">
-            Источник: <code><?= Html::encode($type) ?></code>
+            Источник URL: <code><?= Html::encode($type) ?></code>. Агрегация по унифицированному discovery_domain/normalized_url
         </div>
 
         <?= GridView::widget([
@@ -29,7 +29,7 @@ $this->title = 'Сайты, попавшие в группы (без повто�
             'tableOptions' => ['class' => 'table table-striped table-condensed'],
             'columns' => [
                 [
-                    'label' => 'Домен',
+                    'label' => 'Домен (normalized)',
                     'format' => 'raw',
                     'value' => fn($r) => Html::a(Html::encode($r['domain']), 'https://' . $r['domain'], ['target'=>'_blank']),
                 ],

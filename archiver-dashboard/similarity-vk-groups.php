@@ -16,12 +16,15 @@ $this->title = 'VK группы, попавшие в группы (без пов
     </div>
 
     <div class="box-body">
+        <div class="alert alert-info" style="margin-bottom:10px;">
+            Используются единые правила нормализации URL: lower-case host, нормализация схемы, удаление trailing slash, очистка UTM.
+        </div>
         <?= GridView::widget([
             'dataProvider' => $dataProvider,
             'tableOptions' => ['class' => 'table table-striped table-condensed'],
             'columns' => [
                 [
-                    'label' => 'VK group',
+                    'label' => 'VK group (normalized)',
                     'format' => 'raw',
                     'value' => fn($r) => Html::a(Html::encode($r['vk_group']), $r['vk_group'], ['target'=>'_blank']),
                 ],
