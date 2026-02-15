@@ -69,7 +69,19 @@ class ArchiverSimilarityImage extends ActiveRecord
         $row->image_hash = $im['image_hash'] ?? null;
         $row->milvus_id = isset($im['milvus_id']) ? (int)$im['milvus_id'] : null;
         $row->source_url = $im['source_url'] ?? null;
+        $row->found_at_url = $im['found_at_url'] ?? null;
         $row->discovery_domain = $im['discovery_domain'] ?? null;
+
+        if (!$row->discovery_domain) {
+            $candidate = $row->found_at_url ?: $row->source_url;
+            if ($candidate) {
+                $host = parse_url($candidate, PHP_URL_HOST);
+                if ($host) {
+                    $row->discovery_domain = $host;
+                }
+            }
+        }
+
         $row->created_at_api = $im['created_at'] ?? null;
         $row->added_to_group_at = $im['added_to_group_at'] ?? null;
 

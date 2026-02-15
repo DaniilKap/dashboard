@@ -12,12 +12,10 @@ use yii\data\ActiveDataProvider;
 use yii\db\Expression;
 use yii\db\Query;
 use yii\data\ArrayDataProvider;
-use backend\modules\notary\services\SimilarityGroupsImporter;
-use backend\modules\notary\services\ArchiverSimilarityTopImageRebuilder;
+use backend\modules\notary\services\SimilarityImportService;
 use backend\modules\notary\models\ArchiverSimilarityGroup;
 use backend\modules\notary\models\ArchiverSimilarityImage;
 use backend\modules\notary\models\ArchiverSimilarityDistance;
-use backend\modules\notary\models\ArchiverSimilarityTopImage;
 
 class ArchiverDashboardController extends Controller
 {
@@ -427,241 +425,31 @@ class ArchiverDashboardController extends Controller
         $offset = max(0, (int)Yii::$app->request->get('offset', 0));
         $withDetails = ((int)Yii::$app->request->get('with_details', 0) === 1);
 
+        if (!in_array($imageType, ['', 'vm', 'other', 'mixed'], true)) {
+            return [
+                'status' => 'error',
+                'errors' => [[
+                    'code' => 'invalid_image_type',
+                    'stage' => 'validation',
+                    'group' => null,
+                    'message' => 'image_type must be one of: vm, other, mixed or empty',
+                ]],
+            ];
+        }
+
         $batch = (string)Yii::$app->request->get('batch', '');
         if ($batch === '') $batch = 'manual_' . date('Ymd_His');
 
-        $params = [
+        $service = new SimilarityImportService($this->apiBase());
+
+        return $service->importPage([
             'min_size' => $minSize,
+            'image_type' => $imageType,
             'limit' => $limit,
             'offset' => $offset,
-        ];
-        if ($imageType !== '') $params['image_type'] = $imageType;
-
-        // ✅ 1) Реальный запрос к /api/v1/archiver/similarity_groups
-        $data = $this->apiGet('/api/v1/archiver/similarity_groups', $params); //
-        if (!empty($data['_error'])) {
-            $data['ts'] = date('Y-m-d H:i:s');
-            $data['filters'] = $params;
-            return $data;
-        }
-
-        $now = time();
-        $savedGroups = 0;
-        $savedImages = 0;
-        $savedDistances = 0;
-
-        $groups = $data['groups'] ?? [];
-        if (!is_array($groups)) $groups = [];
-
-        foreach ($groups as $g) {
-            $gid = (int)($g['group_id'] ?? 0);
-            if ($gid <= 0) continue;
-
-            // ✅ 2) upsert group
-            $group = ArchiverSimilarityGroup::findOne(['group_id' => $gid]);
-            if (!$group) {
-                $group = new ArchiverSimilarityGroup();
-                $group->group_id = $gid;
-                $group->created_at = $now;
-                $savedGroups++;
-            }
-
-            $group->created_at_api = $g['created_at'] ?? null;
-            $group->image_count = (int)($g['image_count'] ?? 0);
-            $group->is_mixed = !empty($g['is_mixed']) ? 1 : 0;
-
-            $tc = $g['type_counts'] ?? [];
-            $group->vm_count = (int)($tc['vm'] ?? 0);
-            $group->other_count = (int)($tc['other'] ?? 0);
-
-            $group->avg_distance = isset($g['avg_distance']) ? (float)$g['avg_distance'] : null;
-
-            $group->import_batch = $batch;
-            $group->updated_at = $now;
-            $group->save(false);
-
-            // ✅ 3) distances[] -> table + best_distance map
-            $bestByImageId = [];
-            $distances = $g['distances'] ?? [];
-            if (is_array($distances)) {
-                foreach ($distances as $d) {
-                    $a = (int)($d['image_1_id'] ?? 0);
-                    $b = (int)($d['image_2_id'] ?? 0);
-                    $dist = isset($d['distance']) ? (float)$d['distance'] : null;
-                    if ($a <= 0 || $b <= 0 || $dist === null || $a === $b) continue;
-
-                    $recordedAt = $d['recorded_at'] ?? null;
-
-                    // normalize pair
-                    $i1 = min($a, $b);
-                    $i2 = max($a, $b);
-
-                    $pair = ArchiverSimilarityDistance::findOne([
-                        'group_id' => $gid,
-                        'image_1_id' => $i1,
-                        'image_2_id' => $i2,
-                    ]);
-
-                    if (!$pair) {
-                        $pair = new ArchiverSimilarityDistance();
-                        $pair->group_id = $gid;
-                        $pair->image_1_id = $i1;
-                        $pair->image_2_id = $i2;
-                        $pair->created_at = $now;
-                        $savedDistances++;
-                    }
-
-                    $pair->distance = (float)$dist;
-                    $pair->recorded_at_api = $recordedAt;
-                    $pair->updated_at = $now;
-                    $pair->save(false);
-
-                    if (!isset($bestByImageId[$a]) || $dist < $bestByImageId[$a]) $bestByImageId[$a] = $dist;
-                    if (!isset($bestByImageId[$b]) || $dist < $bestByImageId[$b]) $bestByImageId[$b] = $dist;
-                }
-            }
-
-            // ✅ 4) images[] -> table
-            $images = $g['images'] ?? [];
-            if (!is_array($images)) $images = [];
-
-            // (опционально) detail, если включишь with_details
-            if ($withDetails) {
-                $detail = $this->apiGet('/api/v1/archiver/similarity_groups/' . $gid, []); //
-                if (empty($detail['_error'])) {
-                    // stats на группу
-                    $stats = $detail['statistics'] ?? null;
-                    if (is_array($stats)) {
-                        $group->min_distance = isset($stats['min_distance']) ? (float)$stats['min_distance'] : null;
-                        $group->max_distance = isset($stats['max_distance']) ? (float)$stats['max_distance'] : null;
-                        $group->avg_distance_stats = isset($stats['avg_distance']) ? (float)$stats['avg_distance'] : null;
-                        $group->updated_at = $now;
-                        $group->save(false);
-                    }
-
-                    // distances detail (может быть богаче)
-                    if (is_array($detail['distances'] ?? null)) {
-                        foreach ($detail['distances'] as $d) {
-                            $a = (int)($d['image_1_id'] ?? 0);
-                            $b = (int)($d['image_2_id'] ?? 0);
-                            $dist = isset($d['distance']) ? (float)$d['distance'] : null;
-                            if ($a <= 0 || $b <= 0 || $dist === null || $a === $b) continue;
-
-                            $recordedAt = $d['recorded_at'] ?? null;
-
-                            $i1 = min($a, $b);
-                            $i2 = max($a, $b);
-
-                            $pair = ArchiverSimilarityDistance::findOne([
-                                'group_id' => $gid,
-                                'image_1_id' => $i1,
-                                'image_2_id' => $i2,
-                            ]);
-
-                            if (!$pair) {
-                                $pair = new ArchiverSimilarityDistance();
-                                $pair->group_id = $gid;
-                                $pair->image_1_id = $i1;
-                                $pair->image_2_id = $i2;
-                                $pair->created_at = $now;
-                                $savedDistances++;
-                            }
-
-                            $pair->distance = (float)$dist;
-                            $pair->recorded_at_api = $recordedAt;
-                            $pair->updated_at = $now;
-                            $pair->save(false);
-
-                            if (!isset($bestByImageId[$a]) || $dist < $bestByImageId[$a]) $bestByImageId[$a] = $dist;
-                            if (!isset($bestByImageId[$b]) || $dist < $bestByImageId[$b]) $bestByImageId[$b] = $dist;
-                        }
-                    }
-
-                    if (is_array($detail['images'] ?? null)) {
-                        $images = $detail['images'];
-                    }
-                }
-            }
-
-            foreach ($images as $im) {
-                $imageId = (int)($im['id'] ?? 0);
-                if ($imageId <= 0) continue;
-
-                $row = ArchiverSimilarityImage::findOne(['group_id' => $gid, 'image_id' => $imageId]);
-                if (!$row) {
-                    $row = new ArchiverSimilarityImage();
-                    $row->group_id = $gid;
-                    $row->image_id = $imageId;
-                    $row->created_at = $now;
-                    $savedImages++;
-                }
-
-                $type = (string)($im['image_type'] ?? 'other');
-                if (!in_array($type, ['vm', 'other'], true)) $type = 'other';
-
-                $row->image_type = $type;
-                $row->filename = $im['filename'] ?? null;
-                $row->image_hash = $im['image_hash'] ?? null;
-                $row->milvus_id = isset($im['milvus_id']) ? (int)$im['milvus_id'] : null;
-                $row->source_url = $im['source_url'] ?? null;
-                $row->discovery_domain = $im['discovery_domain'] ?? null;
-                $row->found_at_url = $im['found_at_url'] ?? null;
-
-// если API не дал discovery_domain, попробуем вывести из found_at_url / source_url
-                if (!$row->discovery_domain) {
-                    $candidate = $row->found_at_url ?: $row->source_url;
-                    if ($candidate) {
-                        $host = parse_url($candidate, PHP_URL_HOST);
-                        if ($host) $row->discovery_domain = $host;
-                    }
-                }
-
-
-
-
-                $row->created_at_api = $im['created_at'] ?? null;
-                $row->added_to_group_at = $im['added_to_group_at'] ?? null;
-
-                $row->best_distance = isset($bestByImageId[$imageId]) ? (float)$bestByImageId[$imageId] : null;
-
-                $row->updated_at = $now;
-                $row->save(false);
-            }
-        }
-
-        $apiOffset = (int)($data['offset'] ?? $offset);
-        $apiReturned = (int)($data['returned_groups'] ?? count($groups));
-        $apiTotal = $data['total_groups'] ?? null;
-        $nextOffset = $apiOffset + $apiReturned;
-
-        $done = false;
-        if ($apiTotal !== null) {
-            $done = ($nextOffset >= (int)$apiTotal);
-        } else {
-            $done = ($apiReturned < $limit);
-        }
-
-        return [
-            'status' => 'ok',
-            'ts' => date('Y-m-d H:i:s'),
-            'filters' => $params,
-            'batch' => $batch,
             'with_details' => $withDetails,
-
-            'saved_groups' => $savedGroups,
-            'saved_images' => $savedImages,
-            'saved_distances' => $savedDistances,
-
-            'api' => [
-                'total_groups' => $apiTotal,
-                'returned_groups' => $apiReturned,
-                'limit' => $limit,
-                'offset' => $apiOffset,
-            ],
-
-            'next_offset' => $nextOffset,
-            'done' => $done,
-        ];
+            'batch' => $batch,
+        ]);
     }
 
     // --- 3.4 LIST distances ---
