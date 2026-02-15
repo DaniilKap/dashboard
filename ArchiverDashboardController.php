@@ -6,14 +6,15 @@ use Yii;
 use yii\web\Controller;
 use yii\web\Response;
 use yii\web\BadRequestHttpException;
+use yii\web\ForbiddenHttpException;
+use yii\web\NotFoundHttpException;
 use yii\filters\AccessControl;
 use yii\httpclient\Client;
 use yii\data\ActiveDataProvider;
 use yii\db\Expression;
 use yii\db\Query;
 use yii\data\ArrayDataProvider;
-use backend\modules\notary\services\SimilarityGroupsImporter;
-use backend\modules\notary\services\SimilarityUrlNormalizer;
+use backend\modules\notary\services\SimilarityImportService;
 use backend\modules\notary\models\ArchiverSimilarityGroup;
 use backend\modules\notary\models\ArchiverSimilarityImage;
 use backend\modules\notary\models\ArchiverSimilarityDistance;
@@ -36,11 +37,6 @@ class ArchiverDashboardController extends Controller
     {
         // Лучше положить в params.php / module params
         return Yii::$app->params['archiverApiBase'] ?? 'http://185.189.167.89:8000';
-    }
-
-    private function urlNormalizer(): SimilarityUrlNormalizer
-    {
-        return new SimilarityUrlNormalizer();
     }
 
     private function apiRequest(string $method, string $path, array $query = []): array
@@ -152,6 +148,49 @@ class ArchiverDashboardController extends Controller
         return $this->render('similarity-images', ['dataProvider' => $dp]);
     }
 
+    public function actionTopImages()
+    {
+        $q = ArchiverSimilarityTopImage::find();
+
+        $type = Yii::$app->request->get('type', ''); // vm|other|mixed
+        if ($type === 'vm') {
+            $q->andWhere('vm_occurrence_count = occurrence_count');
+        } elseif ($type === 'other') {
+            $q->andWhere('vm_occurrence_count = 0');
+        } elseif ($type === 'mixed') {
+            $q->andWhere('vm_occurrence_count > 0 AND vm_occurrence_count < occurrence_count');
+        }
+
+        $periodFrom = Yii::$app->request->get('period_from');
+        if ($periodFrom) {
+            $q->andWhere(['>=', 'last_seen_at', strtotime($periodFrom . ' 00:00:00')]);
+        }
+
+        $periodTo = Yii::$app->request->get('period_to');
+        if ($periodTo) {
+            $q->andWhere(['<=', 'last_seen_at', strtotime($periodTo . ' 23:59:59')]);
+        }
+
+        $minOccurrences = Yii::$app->request->get('min_occurrences');
+        if ($minOccurrences !== null && $minOccurrences !== '') {
+            $q->andWhere(['>=', 'occurrence_count', (int)$minOccurrences]);
+        }
+
+        $sort = Yii::$app->request->get('sort', 'occurrence_desc');
+        if ($sort === 'occurrence_asc') {
+            $q->orderBy(['occurrence_count' => SORT_ASC, 'canonical_image_key' => SORT_ASC]);
+        } else {
+            $q->orderBy(['occurrence_count' => SORT_DESC, 'canonical_image_key' => SORT_ASC]);
+        }
+
+        $dp = new ActiveDataProvider([
+            'query' => $q,
+            'pagination' => ['pageSize' => (int)Yii::$app->request->get('per_page', 50)],
+        ]);
+
+        return $this->render('top-images', ['dataProvider' => $dp]);
+    }
+
 
 
     /**
@@ -199,7 +238,7 @@ class ArchiverDashboardController extends Controller
     public function actionSimilarityImport()
     {
         if (!Yii::$app->user->can('admin')) {
-            throw new \yii\web\ForbiddenHttpException('Admins only');
+            throw new ForbiddenHttpException('Admins only');
         }
 
         $defaults = [
@@ -250,51 +289,50 @@ class ArchiverDashboardController extends Controller
     }
     public function actionSimilarityVkGroups()
     {
+
+
         $limit = max(10, (int)Yii::$app->request->get('limit', 10000));
+        $t = '{{%archiver_similarity_image}}';
 
-        $normalizer = $this->urlNormalizer();
-        $counts = [];
+        // Нормализуем URL группы:
+        // - убираем query и trailing slash
+        // - оставляем https://vk.com/<slug>
+        $norm = new Expression("
+      LOWER(
+        REGEXP_REPLACE(
+          REGEXP_SUBSTR(found_at_url, 'https?://vk\\.com/[^\\?\\#\\s]+'),
+          '/+$',
+          ''
+        )
+      )
+    ");
 
-        foreach ((new Query())
-                     ->from(ArchiverSimilarityImage::tableName())
-                     ->select(['group_id', 'found_at_url', 'normalized_url'])
-                     ->batch(1000) as $batch) {
-            foreach ($batch as $row) {
-                $candidate = (string)($row['found_at_url'] ?: $row['normalized_url'] ?: '');
-                $normalized = $normalizer->normalizeUrlForMatch($candidate, false, true);
-                if ($normalized === '' || stripos($normalized, '://vk.com/') === false) {
-                    continue;
-                }
-
-                $parts = parse_url($normalized);
-                $path = (string)($parts['path'] ?? '');
-                if ($path === '' || $path === '/') {
-                    continue;
-                }
-
-                $vkGroup = 'https://vk.com' . rtrim($path, '/');
-                if (!isset($counts[$vkGroup])) {
-                    $counts[$vkGroup] = ['images' => 0, 'group_ids' => []];
-                }
-
-                $counts[$vkGroup]['images']++;
-                $counts[$vkGroup]['group_ids'][(int)($row['group_id'] ?? 0)] = true;
-            }
-        }
+        $rows = (new \yii\db\Query())
+            ->from($t)
+            ->select([
+                'vk_group' => $norm,
+                'images' => new Expression("COUNT(*)"),
+                'groups' => new Expression("COUNT(DISTINCT group_id)"),
+            ])
+            ->where(['like', 'found_at_url', 'vk.com/', false])
+            ->andWhere(['not', ['found_at_url' => null]])
+            ->groupBy($norm)
+            ->orderBy(['images' => SORT_DESC])
+            ->limit($limit)
+            ->all();
 
         $out = [];
-        foreach ($counts as $vkGroup => $meta) {
+        foreach ($rows as $r) {
+            $u = (string)($r['vk_group'] ?? '');
+            if ($u === '') continue;
             $out[] = [
-                'vk_group' => $vkGroup,
-                'images' => (int)$meta['images'],
-                'groups' => count($meta['group_ids']),
+                'vk_group' => $u,
+                'images' => (int)$r['images'],
+                'groups' => (int)$r['groups'],
             ];
         }
 
-        usort($out, static fn($a, $b) => $b['images'] <=> $a['images']);
-        $out = array_slice($out, 0, $limit);
-
-        $dp = new ArrayDataProvider([
+        $dp = new \yii\data\ArrayDataProvider([
             'allModels' => $out,
             'pagination' => ['pageSize' => 100],
             'sort' => false,
@@ -307,52 +345,57 @@ class ArchiverDashboardController extends Controller
 
     public function actionSimilaritySites()
     {
+
+
         $type = (string)Yii::$app->request->get('type', 'found'); // found|source|both
         $limit = max(10, (int)Yii::$app->request->get('limit', 5000));
 
-        $normalizer = $this->urlNormalizer();
-        $counts = [];
+        // Базовая таблица
+        $t = '{{%archiver_similarity_image}}';
 
-        foreach ((new Query())
-                     ->from(ArchiverSimilarityImage::tableName())
-                     ->select(['group_id', 'found_at_url', 'source_url', 'normalized_url', 'discovery_domain'])
-                     ->batch(1000) as $batch) {
-            foreach ($batch as $row) {
-                $candidate = '';
-                if ($type === 'source') {
-                    $candidate = (string)($row['source_url'] ?? '');
-                } elseif ($type === 'both') {
-                    $candidate = (string)($row['normalized_url'] ?: $row['found_at_url'] ?: $row['source_url'] ?: '');
-                } else {
-                    $candidate = (string)($row['found_at_url'] ?? '');
-                }
+        // host из URL (MySQL 8 REGEXP_SUBSTR)
+        // https?://<host>/
+        $hostExpr = function(string $col) {
+            return new Expression("LOWER(REGEXP_SUBSTR($col, 'https?://[^/]+'))");
+        };
 
-                $normalized = $normalizer->normalizeUrlForMatch($candidate, false, true);
-                $domain = $normalizer->extractDomain($row['discovery_domain'] ?: $normalized);
-                if ($domain === null) {
-                    continue;
-                }
+        // Для "both" берём COALESCE(found_at_url, source_url)
+        $urlExpr = ($type === 'source')
+            ? new Expression("source_url")
+            : (($type === 'both')
+                ? new Expression("COALESCE(found_at_url, source_url)")
+                : new Expression("found_at_url"));
 
-                if (!isset($counts[$domain])) {
-                    $counts[$domain] = ['images' => 0, 'group_ids' => []];
-                }
+        $host = new Expression("LOWER(REGEXP_SUBSTR($urlExpr, 'https?://[^/]+'))");
 
-                $counts[$domain]['images']++;
-                $counts[$domain]['group_ids'][(int)($row['group_id'] ?? 0)] = true;
-            }
-        }
+        $rows = (new Query())
+            ->from($t)
+            ->select([
+                'host' => $host, // вернёт 'https://domain.tld'
+                'images' => new Expression("COUNT(*)"),
+                'groups' => new Expression("COUNT(DISTINCT group_id)"),
+            ])
+            ->where(new Expression("$urlExpr IS NOT NULL"))
+            ->andWhere(new Expression("TRIM($urlExpr) <> ''"))
+            ->groupBy($host)
+            ->orderBy(['images' => SORT_DESC])
+            ->limit($limit)
+            ->all();
 
+        // Приведём host к domain без схемы для красоты
         $out = [];
-        foreach ($counts as $domain => $meta) {
+        foreach ($rows as $r) {
+            $h = (string)($r['host'] ?? '');
+            if ($h === '') continue;
+
+            $domain = preg_replace('~^https?://~i', '', $h);
             $out[] = [
                 'domain' => $domain,
-                'images' => (int)$meta['images'],
-                'groups' => count($meta['group_ids']),
+                'host' => $h,
+                'images' => (int)$r['images'],
+                'groups' => (int)$r['groups'],
             ];
         }
-
-        usort($out, static fn($a, $b) => $b['images'] <=> $a['images']);
-        $out = array_slice($out, 0, $limit);
 
         $dp = new ArrayDataProvider([
             'allModels' => $out,
@@ -373,7 +416,7 @@ class ArchiverDashboardController extends Controller
     public function actionImportSimilarityGroups()
     {
         if (!Yii::$app->user->can('admin')) {
-            throw new \yii\web\ForbiddenHttpException('Admins only');
+            throw new ForbiddenHttpException('Admins only');
         }
 
         Yii::$app->response->format = Response::FORMAT_JSON;
@@ -384,237 +427,31 @@ class ArchiverDashboardController extends Controller
         $offset = max(0, (int)Yii::$app->request->get('offset', 0));
         $withDetails = ((int)Yii::$app->request->get('with_details', 0) === 1);
 
+        if (!in_array($imageType, ['', 'vm', 'other', 'mixed'], true)) {
+            return [
+                'status' => 'error',
+                'errors' => [[
+                    'code' => 'invalid_image_type',
+                    'stage' => 'validation',
+                    'group' => null,
+                    'message' => 'image_type must be one of: vm, other, mixed or empty',
+                ]],
+            ];
+        }
+
         $batch = (string)Yii::$app->request->get('batch', '');
         if ($batch === '') $batch = 'manual_' . date('Ymd_His');
 
-        $params = [
+        $service = new SimilarityImportService($this->apiBase());
+
+        return $service->importPage([
             'min_size' => $minSize,
+            'image_type' => $imageType,
             'limit' => $limit,
             'offset' => $offset,
-        ];
-        if ($imageType !== '') $params['image_type'] = $imageType;
-
-        // ✅ 1) Реальный запрос к /api/v1/archiver/similarity_groups
-        $data = $this->apiGet('/api/v1/archiver/similarity_groups', $params); //
-        if (!empty($data['_error'])) {
-            $data['ts'] = date('Y-m-d H:i:s');
-            $data['filters'] = $params;
-            return $data;
-        }
-
-        $now = time();
-        $normalizer = $this->urlNormalizer();
-        $savedGroups = 0;
-        $savedImages = 0;
-        $savedDistances = 0;
-
-        $groups = $data['groups'] ?? [];
-        if (!is_array($groups)) $groups = [];
-
-        foreach ($groups as $g) {
-            $gid = (int)($g['group_id'] ?? 0);
-            if ($gid <= 0) continue;
-
-            // ✅ 2) upsert group
-            $group = ArchiverSimilarityGroup::findOne(['group_id' => $gid]);
-            if (!$group) {
-                $group = new ArchiverSimilarityGroup();
-                $group->group_id = $gid;
-                $group->created_at = $now;
-                $savedGroups++;
-            }
-
-            $group->created_at_api = $g['created_at'] ?? null;
-            $group->image_count = (int)($g['image_count'] ?? 0);
-            $group->is_mixed = !empty($g['is_mixed']) ? 1 : 0;
-
-            $tc = $g['type_counts'] ?? [];
-            $group->vm_count = (int)($tc['vm'] ?? 0);
-            $group->other_count = (int)($tc['other'] ?? 0);
-
-            $group->avg_distance = isset($g['avg_distance']) ? (float)$g['avg_distance'] : null;
-
-            $group->import_batch = $batch;
-            $group->updated_at = $now;
-            $group->save(false);
-
-            // ✅ 3) distances[] -> table + best_distance map
-            $bestByImageId = [];
-            $distances = $g['distances'] ?? [];
-            if (is_array($distances)) {
-                foreach ($distances as $d) {
-                    $a = (int)($d['image_1_id'] ?? 0);
-                    $b = (int)($d['image_2_id'] ?? 0);
-                    $dist = isset($d['distance']) ? (float)$d['distance'] : null;
-                    if ($a <= 0 || $b <= 0 || $dist === null || $a === $b) continue;
-
-                    $recordedAt = $d['recorded_at'] ?? null;
-
-                    // normalize pair
-                    $i1 = min($a, $b);
-                    $i2 = max($a, $b);
-
-                    $pair = ArchiverSimilarityDistance::findOne([
-                        'group_id' => $gid,
-                        'image_1_id' => $i1,
-                        'image_2_id' => $i2,
-                    ]);
-
-                    if (!$pair) {
-                        $pair = new ArchiverSimilarityDistance();
-                        $pair->group_id = $gid;
-                        $pair->image_1_id = $i1;
-                        $pair->image_2_id = $i2;
-                        $pair->created_at = $now;
-                        $savedDistances++;
-                    }
-
-                    $pair->distance = (float)$dist;
-                    $pair->recorded_at_api = $recordedAt;
-                    $pair->updated_at = $now;
-                    $pair->save(false);
-
-                    if (!isset($bestByImageId[$a]) || $dist < $bestByImageId[$a]) $bestByImageId[$a] = $dist;
-                    if (!isset($bestByImageId[$b]) || $dist < $bestByImageId[$b]) $bestByImageId[$b] = $dist;
-                }
-            }
-
-            // ✅ 4) images[] -> table
-            $images = $g['images'] ?? [];
-            if (!is_array($images)) $images = [];
-
-            // (опционально) detail, если включишь with_details
-            if ($withDetails) {
-                $detail = $this->apiGet('/api/v1/archiver/similarity_groups/' . $gid, []); //
-                if (empty($detail['_error'])) {
-                    // stats на группу
-                    $stats = $detail['statistics'] ?? null;
-                    if (is_array($stats)) {
-                        $group->min_distance = isset($stats['min_distance']) ? (float)$stats['min_distance'] : null;
-                        $group->max_distance = isset($stats['max_distance']) ? (float)$stats['max_distance'] : null;
-                        $group->avg_distance_stats = isset($stats['avg_distance']) ? (float)$stats['avg_distance'] : null;
-                        $group->updated_at = $now;
-                        $group->save(false);
-                    }
-
-                    // distances detail (может быть богаче)
-                    if (is_array($detail['distances'] ?? null)) {
-                        foreach ($detail['distances'] as $d) {
-                            $a = (int)($d['image_1_id'] ?? 0);
-                            $b = (int)($d['image_2_id'] ?? 0);
-                            $dist = isset($d['distance']) ? (float)$d['distance'] : null;
-                            if ($a <= 0 || $b <= 0 || $dist === null || $a === $b) continue;
-
-                            $recordedAt = $d['recorded_at'] ?? null;
-
-                            $i1 = min($a, $b);
-                            $i2 = max($a, $b);
-
-                            $pair = ArchiverSimilarityDistance::findOne([
-                                'group_id' => $gid,
-                                'image_1_id' => $i1,
-                                'image_2_id' => $i2,
-                            ]);
-
-                            if (!$pair) {
-                                $pair = new ArchiverSimilarityDistance();
-                                $pair->group_id = $gid;
-                                $pair->image_1_id = $i1;
-                                $pair->image_2_id = $i2;
-                                $pair->created_at = $now;
-                                $savedDistances++;
-                            }
-
-                            $pair->distance = (float)$dist;
-                            $pair->recorded_at_api = $recordedAt;
-                            $pair->updated_at = $now;
-                            $pair->save(false);
-
-                            if (!isset($bestByImageId[$a]) || $dist < $bestByImageId[$a]) $bestByImageId[$a] = $dist;
-                            if (!isset($bestByImageId[$b]) || $dist < $bestByImageId[$b]) $bestByImageId[$b] = $dist;
-                        }
-                    }
-
-                    if (is_array($detail['images'] ?? null)) {
-                        $images = $detail['images'];
-                    }
-                }
-            }
-
-            foreach ($images as $im) {
-                $imageId = (int)($im['id'] ?? 0);
-                if ($imageId <= 0) continue;
-
-                $row = ArchiverSimilarityImage::findOne(['group_id' => $gid, 'image_id' => $imageId]);
-                if (!$row) {
-                    $row = new ArchiverSimilarityImage();
-                    $row->group_id = $gid;
-                    $row->image_id = $imageId;
-                    $row->created_at = $now;
-                    $savedImages++;
-                }
-
-                $type = (string)($im['image_type'] ?? 'other');
-                if (!in_array($type, ['vm', 'other'], true)) $type = 'other';
-
-                $row->image_type = $type;
-                $row->filename = $im['filename'] ?? null;
-                $row->image_hash = $im['image_hash'] ?? null;
-                $row->milvus_id = isset($im['milvus_id']) ? (int)$im['milvus_id'] : null;
-                $row->source_url = $im['source_url'] ?? null;
-                $row->found_at_url = $im['found_at_url'] ?? null;
-
-                $row->normalized_url = $normalizer->normalizeUrlForMatch((string)($row->source_url ?: $row->found_at_url), false, true) ?: null;
-
-                $discoveryDomain = $normalizer->extractDomain($im['discovery_domain'] ?? null);
-                if ($discoveryDomain === null) {
-                    $discoveryDomain = $normalizer->extractDomain($row->found_at_url ?: $row->source_url);
-                }
-                $row->discovery_domain = $discoveryDomain;
-
-                $row->created_at_api = $im['created_at'] ?? null;
-                $row->added_to_group_at = $im['added_to_group_at'] ?? null;
-
-                $row->best_distance = isset($bestByImageId[$imageId]) ? (float)$bestByImageId[$imageId] : null;
-
-                $row->updated_at = $now;
-                $row->save(false);
-            }
-        }
-
-        $apiOffset = (int)($data['offset'] ?? $offset);
-        $apiReturned = (int)($data['returned_groups'] ?? count($groups));
-        $apiTotal = $data['total_groups'] ?? null;
-        $nextOffset = $apiOffset + $apiReturned;
-
-        $done = false;
-        if ($apiTotal !== null) {
-            $done = ($nextOffset >= (int)$apiTotal);
-        } else {
-            $done = ($apiReturned < $limit);
-        }
-
-        return [
-            'status' => 'ok',
-            'ts' => date('Y-m-d H:i:s'),
-            'filters' => $params,
-            'batch' => $batch,
             'with_details' => $withDetails,
-
-            'saved_groups' => $savedGroups,
-            'saved_images' => $savedImages,
-            'saved_distances' => $savedDistances,
-
-            'api' => [
-                'total_groups' => $apiTotal,
-                'returned_groups' => $apiReturned,
-                'limit' => $limit,
-                'offset' => $apiOffset,
-            ],
-
-            'next_offset' => $nextOffset,
-            'done' => $done,
-        ];
+            'batch' => $batch,
+        ]);
     }
 
     // --- 3.4 LIST distances ---
@@ -714,148 +551,46 @@ class ArchiverDashboardController extends Controller
     public function actionRebuildTopFromExisting()
     {
         if (!Yii::$app->user->can('admin')) {
-            throw new \yii\web\ForbiddenHttpException('Admins only');
+            throw new ForbiddenHttpException('Admins only');
         }
 
         Yii::$app->response->format = \yii\web\Response::FORMAT_JSON;
 
-        $imageType = (string)Yii::$app->request->get('image_type', 'mixed'); // '', vm, other, mixed
-        $limit = max(1, (int)Yii::$app->request->get('limit', 500));
         $reset = ((int)Yii::$app->request->get('reset', 1) === 1);
-
-        // 1) Забираем TOP
-        $params = ['limit' => $limit];
-        if ($imageType !== '') $params['image_type'] = $imageType;
-
-        $top = $this->apiGet('/api/v1/archiver/stats/top_images', $params); // :contentReference[oaicite:2]{index=2}
-        if (!empty($top['_error'])) {
-            return $top;
-        }
-
-        $items = $top['top_recurring_images'] ?? [];
-        if (!is_array($items)) $items = [];
-
-        $now = time();
-        $normalizer = $this->urlNormalizer();
-
-        // 2) Сброс флагов
-        $resetGroups = 0;
-        $resetImages = 0;
-
-        if ($reset) {
-            $resetGroups = ArchiverSimilarityGroup::updateAll([
-                'is_top' => 0,
-                'top_occurrence_count' => null,
-                'top_avg_similarity' => null,
-                'updated_at' => $now,
-            ]);
-
-            $resetImages = ArchiverSimilarityImage::updateAll([
-                'is_top_group' => 0,
-                'updated_at' => $now,
-            ]);
-        }
-
-        // 3) Собираем:
-        // - group_id -> мета
-        // - список URL (source_urls + sample_image.url)
-        $topByGroup = [];
-        $urls = [];
-
-        foreach ($items as $it) {
-            $gid = (int)($it['group_id'] ?? 0);
-            if ($gid > 0) {
-                $topByGroup[$gid] = [
-                    'occurrence_count' => isset($it['occurrence_count']) ? (int)$it['occurrence_count'] : null,
-                    'avg_similarity' => isset($it['avg_similarity']) ? (float)$it['avg_similarity'] : null,
-                ];
-            }
-
-            // source_urls[]
-            if (!empty($it['source_urls']) && is_array($it['source_urls'])) {
-                foreach ($it['source_urls'] as $u) {
-                    $u = $normalizer->normalizeUrlForMatch((string)$u, false, true);
-                    if ($u !== '') $urls[$u] = true;
-                }
-            }
-
-            // sample_image.url
-            $sampleUrl = $it['sample_image']['url'] ?? null; // :contentReference[oaicite:3]{index=3}
-            if (is_string($sampleUrl)) {
-                $u = $normalizer->normalizeUrlForMatch($sampleUrl, false, true);
-                if ($u !== '') $urls[$u] = true;
-            }
-        }
-
-        $groupIds = array_keys($topByGroup);
-        $urlList = array_keys($urls);
-
-        // 4) Проставляем TOP в groups по group_id
-        $markedGroups = 0;
-        $markedGroupsIds = 0;
-
-        if (!empty($groupIds)) {
-            $markedGroups = ArchiverSimilarityGroup::updateAll([
-                'is_top' => 1,
-                'updated_at' => $now,
-            ], ['in', 'group_id', $groupIds]);
-
-            // occurrence_count / avg_similarity — точечно по group_id
-            foreach ($topByGroup as $gid => $meta) {
-                ArchiverSimilarityGroup::updateAll([
-                    'top_occurrence_count' => $meta['occurrence_count'],
-                    'top_avg_similarity' => $meta['avg_similarity'],
-                    'updated_at' => $now,
-                ], ['group_id' => (int)$gid]);
-                $markedGroupsIds++;
-            }
-        }
-
-        // 5) Проставляем TOP в images:
-        // 5.1) по group_id (если группы уже в БД)
-        $markedImagesByGroup = 0;
-        if (!empty($groupIds)) {
-            $markedImagesByGroup = ArchiverSimilarityImage::updateAll([
-                'is_top_group' => 1,
-                'updated_at' => $now,
-            ], ['in', 'group_id', $groupIds]);
-        }
-
-        // 5.2) по URL (важный момент)
-        $markedImagesByUrl = 0;
-        if (!empty($urlList)) {
-            $markedImagesByUrl = ArchiverSimilarityImage::updateAll(
-                ['is_top_group' => 1, 'updated_at' => $now],
-                ['in', 'normalized_url', $urlList]
-            );
-        }
+        $rebuilder = new ArchiverSimilarityTopImageRebuilder();
+        $result = $rebuilder->rebuild($reset);
 
         return [
             'status' => 'ok',
             'ts' => date('Y-m-d H:i:s'),
             'request' => [
-                'image_type' => $imageType,
-                'limit' => $limit,
                 'reset' => $reset ? 1 : 0,
             ],
-            'top' => [
-                'items' => count($items),
-                'unique_group_ids' => count($groupIds),
-                'unique_urls' => count($urlList),
-            ],
-            'reset' => [
-                'groups_rows' => $resetGroups,
-                'images_rows' => $resetImages,
-            ],
-            'marked' => [
-                'groups_rows_is_top' => $markedGroups,
-                'groups_rows_updated_meta' => $markedGroupsIds,
-                'images_rows_by_group_id' => $markedImagesByGroup,
-                'images_rows_by_url' => $markedImagesByUrl,
+            'aggregation' => [
+                'target_table' => ArchiverSimilarityTopImage::tableName(),
+                'rows_inserted' => $result['rows_inserted'],
+                'recalculated_at' => $result['recalculated_at'],
             ],
         ];
     }
 
+    /**
+     * Нормализация URL под матчинг в БД:
+     * - trim
+     * - убрать #fragment
+     * - НЕ трогаем query (бывает важен), но можно будет расширить
+     */
+    private function normalizeUrlForMatch(string $url): string
+    {
+        $url = trim($url);
+        if ($url === '') return '';
+
+        // remove fragment
+        $hashPos = strpos($url, '#');
+        if ($hashPos !== false) $url = substr($url, 0, $hashPos);
+
+        return $url;
+    }
     public function actionSimilarityGroupsWithVm()
     {
 

@@ -66,6 +66,7 @@ $rebuildTopUrl = Url::to(['/notary/archiver-dashboard/rebuild-top-from-existing'
                     Rebuild TOP (DB only)
                 </button>
                 <button id="btnStop" class="btn btn-danger" disabled style="margin-left:6px;">Stop</button>
+                <?= Html::a('Top Images', ['top-images'], ['class' => 'btn btn-default', 'style' => 'margin-left:6px;']) ?>
             </form>
 
             <div class="well well-sm" style="margin-bottom:10px;">

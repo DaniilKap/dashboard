@@ -3,7 +3,6 @@
 namespace backend\modules\notary\models;
 
 use yii\db\ActiveRecord;
-use backend\modules\notary\services\SimilarityUrlNormalizer;
 
 class ArchiverSimilarityImage extends ActiveRecord
 {
@@ -17,7 +16,7 @@ class ArchiverSimilarityImage extends ActiveRecord
         return [
             [['group_id', 'image_id', 'image_type', 'created_at', 'updated_at'], 'required'],
             [['group_id', 'image_id', 'milvus_id', 'created_at', 'updated_at'], 'integer'],
-            [['filename', 'source_url','found_at_url', 'normalized_url'], 'string'],
+            [['filename', 'source_url','found_at_url'], 'string'],
             [['image_hash'], 'string', 'max' => 128],
             [['discovery_domain'], 'string', 'max' => 255],
             [['image_type'], 'string', 'max' => 16],
@@ -37,7 +36,6 @@ class ArchiverSimilarityImage extends ActiveRecord
             'best_distance' => 'Best distance',
             'discovery_domain' => 'Domain',
             'source_url' => 'Source URL',
-            'normalized_url' => 'Normalized URL',
             'created_at_api' => 'Created (API)',
         ];
     }
@@ -70,18 +68,19 @@ class ArchiverSimilarityImage extends ActiveRecord
         $row->filename = $im['filename'] ?? null;
         $row->image_hash = $im['image_hash'] ?? null;
         $row->milvus_id = isset($im['milvus_id']) ? (int)$im['milvus_id'] : null;
-        $normalizer = new SimilarityUrlNormalizer();
-
         $row->source_url = $im['source_url'] ?? null;
         $row->found_at_url = $im['found_at_url'] ?? null;
+        $row->discovery_domain = $im['discovery_domain'] ?? null;
 
-        $row->normalized_url = $normalizer->normalizeUrlForMatch((string)($row->source_url ?: $row->found_at_url), false, true) ?: null;
-
-        $discoveryDomain = $normalizer->extractDomain($im['discovery_domain'] ?? null);
-        if ($discoveryDomain === null) {
-            $discoveryDomain = $normalizer->extractDomain($row->found_at_url ?: $row->source_url);
+        if (!$row->discovery_domain) {
+            $candidate = $row->found_at_url ?: $row->source_url;
+            if ($candidate) {
+                $host = parse_url($candidate, PHP_URL_HOST);
+                if ($host) {
+                    $row->discovery_domain = $host;
+                }
+            }
         }
-        $row->discovery_domain = $discoveryDomain;
 
         $row->created_at_api = $im['created_at'] ?? null;
         $row->added_to_group_at = $im['added_to_group_at'] ?? null;
