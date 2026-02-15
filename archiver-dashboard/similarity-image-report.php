@@ -5,10 +5,13 @@ use yii\helpers\Html;
 /** @var $main \backend\modules\notary\models\ArchiverSimilarityImage */
 /** @var $group \backend\modules\notary\models\ArchiverSimilarityGroup|null */
 /** @var $byDay array */
+/** @var $filters array */
 
 $this->title = 'Отчёт по изображению #' . $main->image_id;
 
 $imgUrl = $main->source_url ?: 'https://backend.vernimoe.ru/storage/right/'.$main->filename;
+$minDistance = $filters['min_distance'] ?? '';
+$maxDistance = $filters['max_distance'] ?? '16';
 ?>
 
 <div class="box box-primary">
@@ -39,6 +42,23 @@ $imgUrl = $main->source_url ?: 'https://backend.vernimoe.ru/storage/right/'.$mai
 
         <hr>
 
+        <form method="get" class="form-inline" style="margin-bottom: 15px; display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+            <input type="hidden" name="image_id" value="<?= (int)$main->image_id ?>">
+
+            <div class="form-group">
+                <label for="min-distance" style="display:block;">Сходство от</label>
+                <input id="min-distance" type="number" step="0.01" min="0" name="min_distance" value="<?= Html::encode($minDistance) ?>" class="form-control" placeholder="например 0">
+            </div>
+
+            <div class="form-group">
+                <label for="max-distance" style="display:block;">Сходство до</label>
+                <input id="max-distance" type="number" step="0.01" min="0" name="max_distance" value="<?= Html::encode($maxDistance) ?>" class="form-control" placeholder="по умолчанию 16">
+            </div>
+
+            <button type="submit" class="btn btn-primary">Применить фильтр</button>
+            <a href="?image_id=<?= (int)$main->image_id ?>&max_distance=16" class="btn btn-default">Сбросить</a>
+        </form>
+
         <h4 style="margin-top:0;">Остальные фото группы (по дням)</h4>
         <div style="max-height: 600px;
     overflow-x: auto;">
@@ -52,7 +72,10 @@ $imgUrl = $main->source_url ?: 'https://backend.vernimoe.ru/storage/right/'.$mai
                     <table class="table table-striped table-condensed">
                         <thead>
                         <tr>
-                            <th style="width:220px;"></th>
+                            <th style="width:220px;">Найденная</th>
+                            <?php if ($main->image_type === 'vm'): ?>
+                                <th style="width:600px;">Пара (основная VM + найденная)</th>
+                            <?php endif; ?>
                             <th>Сходство коэф (меньше-лучше)</th>
                             <th>Домен</th>
                             <th>url</th>
@@ -73,6 +96,31 @@ $imgUrl = $main->source_url ?: 'https://backend.vernimoe.ru/storage/right/'.$mai
                                 </td>
 
 
+                                <?php if ($main->image_type === 'vm'): ?>
+                                    <td>
+                                        <div style="display:flex; align-items:center; gap:10px;">
+                                            <div style="text-align:center;">
+                                                <div style="font-size:12px; color:#666; margin-bottom:4px;">VM (основная)</div>
+                                                <?php if ($imgUrl): ?>
+                                                    <a href="<?= Html::encode($imgUrl) ?>" target="_blank">
+                                                        <img src="<?= Html::encode($imgUrl) ?>" style="width:180px; height:auto; border-radius:4px; border:1px solid #eee;">
+                                                    </a>
+                                                <?php endif; ?>
+                                            </div>
+                                            <div style="font-size:18px; color:#777;">↔</div>
+                                            <div style="text-align:center;">
+                                                <div style="font-size:12px; color:#666; margin-bottom:4px;">Найденная</div>
+                                                <?php if ($u): ?>
+                                                    <a href="<?= Html::encode($u) ?>" target="_blank">
+                                                        <img src="<?= Html::encode($u) ?>" style="width:180px; height:auto; border-radius:4px; border:1px solid #eee;">
+                                                    </a>
+                                                <?php else: ?>
+                                                    —
+                                                <?php endif; ?>
+                                            </div>
+                                        </div>
+                                    </td>
+                                <?php endif; ?>
                                 <td><?= $r['pair_distance'] === null ? '' : Html::encode($r['pair_distance']) ?></td>
                                 <td><?= Html::encode($r['discovery_domain'] ?? '') ?></td>
                                 <td><?= $u ? Html::a($r['found_at_url'], $r['found_at_url'], ['target' => '_blank']) : '' ?></td>

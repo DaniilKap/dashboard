@@ -681,6 +681,13 @@ class ArchiverDashboardController extends Controller
 
 
         $imageId = (int)$image_id;
+        $request = Yii::$app->request;
+
+        $minDistanceRaw = $request->get('min_distance', '');
+        $maxDistanceRaw = $request->get('max_distance', '16');
+
+        $minDistance = $minDistanceRaw === '' ? null : (float)$minDistanceRaw;
+        $maxDistance = $maxDistanceRaw === '' ? null : (float)$maxDistanceRaw;
 
         $main = ArchiverSimilarityImage::find()
             ->where(['image_id' => $imageId])
@@ -707,6 +714,14 @@ class ArchiverDashboardController extends Controller
             'd.group_id = i.group_id AND d.image_1_id = LEAST(:mainId, i.image_id) AND d.image_2_id = GREATEST(:mainId, i.image_id)',
             [':mainId' => $imageId]
         );
+
+        if ($minDistance !== null) {
+            $q->andWhere(['>=', 'd.distance', $minDistance]);
+        }
+
+        if ($maxDistance !== null) {
+            $q->andWhere(['<=', 'd.distance', $maxDistance]);
+        }
 
         // Вычислим "день"
         $dayExpr = new Expression("DATE(COALESCE(i.added_to_group_at, i.created_at_api))");
@@ -738,6 +753,10 @@ class ArchiverDashboardController extends Controller
             'main' => $main,
             'group' => $group,
             'byDay' => $byDay,
+            'filters' => [
+                'min_distance' => $minDistanceRaw,
+                'max_distance' => $maxDistanceRaw,
+            ],
         ]);
     }
 
